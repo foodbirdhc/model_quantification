@@ -1,0 +1,23 @@
+output/
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+
+# Logs
+*.log
+
+# Generated results
+output/
+results/
+
+# Model files
+*.engine
+*.trt
