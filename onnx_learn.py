@@ -63,7 +63,127 @@ def save_layer_outputs_to_file(layer_outputs, output_dir):
             "inf_count": int(np.isinf(tensor).sum()),
         }
         with open(tensor_json_file_path, "w") as f:
-            json.dump(result_dict, f)
+            json.dump(result_dict, f, indent=2)
+
+def auto_detect_module_prefixes(model):
+    """启发式自动检测 ONNX 中包含模块语义的前缀。"""
+    prefix_counter = {}
+
+    for node in model.graph.node:
+        # 优先看 node.name，因为它更接近 PyTorch 的模块名
+        if node.name:
+            name = node.name.strip()
+            # 取首段前缀，如 "encoders.line.layers.0" -> "encoders"
+            if "." in name:
+                prefix = name.split(".", 1)[0]
+                prefix_counter[prefix] = prefix_counter.get(prefix, 0) + 1
+
+        for out_name in node.output:
+            if not out_name:
+                continue
+            if "." in out_name:
+                prefix = out_name.split(".", 1)[0]
+                prefix_counter[prefix] = prefix_counter.get(prefix, 0) + 1
+
+    # 只保留高频、较有意义的前缀，避免把泛化前缀当成模块名
+    candidate_prefixes = []
+    for prefix, count in sorted(prefix_counter.items(), key=lambda x: x[1], reverse=True):
+        if count >= 2 and len(prefix) > 2:
+            candidate_prefixes.append(prefix + ".")
+
+    # 额外兜底：常见模块名关键词
+    fallback_prefixes = [
+        "encoders.",
+        "transformer.",
+        "gate_fusion",
+        "initial_decoder.",
+        "ln",
+        "pos_emb",
+        "final_",
+    ]
+    for prefix in fallback_prefixes:
+        if prefix not in candidate_prefixes:
+            candidate_prefixes.append(prefix)
+
+    return tuple(candidate_prefixes)
+
+
+def convert_model_to_module_output(model_path, output_model_path,
+                                  module_prefixes=None,
+                                  keep_existing_outputs=True):
+    model = onnx.load(model_path)
+    graph = model.graph
+
+    if module_prefixes is None:
+        module_prefixes = auto_detect_module_prefixes(model)
+
+    value_info_map = {}
+    for vi in graph.value_info:
+        value_info_map[vi.name] = vi
+    for inp in graph.input:
+        value_info_map[inp.name] = inp
+    for out in graph.output:
+        value_info_map[out.name] = out
+
+    original_outputs = [o for o in graph.output]
+    matched_outputs = []
+    seen = set()
+
+    for node in graph.node:
+        node_name = (node.name or "").strip()
+        for out_name in node.output:
+            if not out_name:
+                continue
+
+            candidate = out_name
+            if node_name and any(node_name.startswith(prefix) for prefix in module_prefixes):
+                candidate = node_name
+
+            if not any(candidate.startswith(prefix) for prefix in module_prefixes):
+                continue
+
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+
+            value_info = value_info_map.get(out_name)
+            if value_info is None:
+                continue
+
+            matched_outputs.append(
+                onnx.helper.make_tensor_value_info(
+                    candidate,
+                    value_info.type.tensor_type.elem_type,
+                    value_info.type.tensor_type.shape
+                )
+            )
+
+    # 如果没有匹配到模块输出，保留原始输出并写出到目标文件，避免只剩最终输出
+    if not matched_outputs:
+        print("[module-output] no module-like names matched; copy original model to output path.")
+        output_parent = Path(output_model_path).parent
+        output_parent.mkdir(parents=True, exist_ok=True)
+        onnx.save(model, output_model_path)
+        print(f"[module-output] saved original model to: {output_model_path}")
+        return output_model_path
+
+    graph.output.clear()
+    for out in matched_outputs:
+        graph.output.append(out)
+
+    if keep_existing_outputs:
+        existing_names = {o.name for o in graph.output}
+        for out in original_outputs:
+            if out.name not in existing_names:
+                graph.output.append(out)
+
+    Path(output_model_path).parent.mkdir(parents=True, exist_ok=True)
+    onnx.save(model, output_model_path)
+    print(f"[module-output] saved to: {output_model_path}")
+    print(f"[module-output] matched output count: {len(matched_outputs)}")
+    for out in graph.output:
+        print("  -", out.name)
+    return output_model_path
 
 def convert_model_to_all_node_output(model_path, output_model_path):
     """
@@ -175,7 +295,8 @@ def get_all_output_tensor(model_path):
             f"shape={input_data.shape}, "
             f"dtype={input_data.dtype}"
         )
-    print(f"input_feed: {input_feed}")
+    print(f"input shape: {[input_data.shape for input_data in input_feed.values()]}")
+    # print(f"input_feed: {input_feed}")
 
     # runtime, None 表示获取所有输出
     outputs = session.run(
@@ -183,6 +304,9 @@ def get_all_output_tensor(model_path):
         input_feed=input_feed)
 
     output_metas = session.get_outputs()
+
+    print(f"outputs shape: {[output.shape for output in outputs]}")
+    print(f"output_metas shape: {[output.shape for output in output_metas]}")
     
     all_outputs = {}
 
@@ -246,9 +370,14 @@ def main():
     args = ap.parse_args()
 
     # get_model_info(args.model)
-    # new_model_path = convert_model_to_all_node_output(args.model,"./output/model_all_output.onnx")
+    new_model_path = convert_model_to_all_node_output(args.model,"./output/model_all_output.onnx")
+    # new_model_path = convert_model_to_module_output(
+    #     args.model,
+    #     "./output/model_all_output.onnx",
+    #     module_prefixes=None,
+    # )
     all_layer_outputs = get_all_output_tensor("./output/model_all_output.onnx")
-    save_layer_outputs_to_file(all_layer_outputs, "./output/layer_outputs")
+    save_layer_outputs_to_file(all_layer_outputs, "./output/layer_outputs/onnx/")
 
 if __name__ == "__main__":
     main()
